@@ -56,6 +56,7 @@
 #define AP_PACKAGE_CONFIG_PATH "/data/adb/ap/package_config"
 #define ANDROID_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define ANDROID_PACKAGES_LIST_TMP_PATH "/data/system/packages.list.tmp"
+#define ANDROID_PACKAGES_XML_PATH "/data/system/packages.xml"
 #define AP_KPM_DIR AP_DIR "kpm/"
 #define AP_KPM_NAME_LEN 128
 #define AP_KPM_MAX_MODULES 256
@@ -1073,6 +1074,72 @@ out_free:
 
 
 
+static int find_apk_from_packages_xml(const char *pkg,
+                                      char *apk_path,
+                                      size_t apk_path_len)
+{
+    
+    loff_t len = 0;
+    char *data;
+    char *p;
+    int rc = -ENOENT;
+
+    data = (char *)kernel_read_file(ANDROID_PACKAGES_XML_PATH, &len);
+    if (!data || len <= 0) {
+        log_boot("read %s failed\n", ANDROID_PACKAGES_XML_PATH);
+        return -ENOENT;
+    }
+
+    log_boot("%s size: %lld bytes\n", ANDROID_PACKAGES_XML_PATH, len);
+
+    p = data;
+
+    while ((p = strstr(p, pkg))) {
+        char *start = p;
+        while (start > data && *start != '<')
+            start--;
+
+        if (strncmp(start, "<package", 8) != 0) {
+            p += strlen(pkg);
+            continue;
+        }
+        char *cp = strstr(start, "codePath=\"");
+        if (!cp) {
+            p += strlen(pkg);
+            continue;
+        }
+
+        cp += strlen("codePath=\"");
+
+        char *end = strchr(cp, '"');
+        if (!end) {
+            p += strlen(pkg);
+            continue;
+        }
+
+        size_t l = end - cp;
+
+        if (l + strlen("/base.apk") >= apk_path_len) {
+            rc = -ENOSPC;
+            goto out;
+        }
+
+        memcpy(apk_path, cp, l);
+        memcpy(apk_path + l, "/base.apk", strlen("/base.apk") + 1);
+
+        log_boot("apk found (xml): %s\n", apk_path);
+
+        rc = 0;
+        goto out;
+    }
+
+    log_boot("apk not found in %s for %s\n", ANDROID_PACKAGES_XML_PATH, pkg);
+
+out:
+    kvfree(data);
+    return rc;
+}
+
 static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out, int use_tmp)
 {
     uid_t last_uid = TRUSTED_MANAGER_UID_INVALID;
@@ -1097,11 +1164,19 @@ static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out
                 apk_path, PATH_MAX,
                 i);
         if (rc) {
-            log_boot("no apk via iterate for %s rc=%d\n",
+            log_boot("no apk via iterate for %s rc=%d, fallback to xml\n",
              trusted_managers[i].package, rc);
 
+            rc = find_apk_from_packages_xml(
+                    trusted_managers[i].package,
+                    apk_path,
+                    PATH_MAX);
 
-            continue;
+            if (rc) {
+                log_boot("no apk for %s via xml rc=%d\n",
+                        trusted_managers[i].package, rc);
+                continue;
+            }
         }
 
         if (!apk_matches_trusted_signature(
